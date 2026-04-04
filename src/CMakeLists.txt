@@ -72,6 +72,7 @@ add_library(llama
             models/gemma.cpp
             models/gemma2-iswa.cpp
             models/gemma3.cpp
+            models/gemmeh.cpp
             models/gemma3n-iswa.cpp
             models/gemma4-iswa.cpp
             models/glm4-moe.cpp

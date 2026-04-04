@@ -6938,6 +6938,105 @@ class Gemma3Model(TextModel):
         yield from super().modify_tensors(data_torch, name, bid)
 
 
+@ModelBase.register("GemmehForCausalLM")
+class GemmehModel(TextModel):
+    model_arch = gguf.MODEL_ARCH.GEMMEH
+
+    def norm_shift(self, name: str) -> float:
+        return 1.0 if name.endswith("norm.weight") else 0.0  # Gemma3RMSNorm adds 1.0 to the norm value
+
+    def set_vocab(self):
+        if (self.dir_model / "tokenizer.model").is_file():
+            tokens, scores, toktypes = self._create_vocab_sentencepiece()
+
+            # force user_defined special tokens to control type (Necessary for chat model)
+            control_token_ids = {
+                "<start_of_turn>":    4,
+                "<end_of_turn>":      5,
+                "<start_of_thought>": 6,
+                "<end_of_thought>":   7,
+                "<|endoftext|>":      8,
+            }
+            for token_id in control_token_ids.values():
+                toktypes[token_id] = SentencePieceTokenTypes.CONTROL
+
+            self.gguf_writer.add_tokenizer_model("llama")
+            self.gguf_writer.add_tokenizer_pre("default")
+            self.gguf_writer.add_token_list(tokens)
+            self.gguf_writer.add_token_scores(scores)
+            self.gguf_writer.add_token_types(toktypes)
+
+            special_vocab = gguf.SpecialVocab(self.dir_model, n_vocab=len(tokens))
+            special_vocab.add_to_gguf(self.gguf_writer)
+
+            self.gguf_writer.add_add_space_prefix(False)
+            self.gguf_writer.add_eos_token_id(5)    # <end_of_turn>
+            self.gguf_writer.add_bos_token_id(4)    # <start_of_turn>
+        else:
+            self._set_vocab_gpt2()
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        hparams = self.hparams
+
+        # some default values are not specified in the hparams
+        self.gguf_writer.add_context_length(hparams.get("max_position_embeddings", 4096))
+        self.gguf_writer.add_head_count(hparams.get("num_attention_heads", 8))
+        self.gguf_writer.add_layer_norm_rms_eps(self.hparams.get("rms_norm_eps", 1e-6))
+        self.gguf_writer.add_key_length(hparams.get("head_dim", 256))
+        self.gguf_writer.add_value_length(hparams.get("head_dim", 256))
+        self.gguf_writer.add_rope_freq_base(hparams.get("rope_theta", 10000)) # No local layers
+        # attn_logit_softcapping is removed in Gemma3
+        assert hparams.get("attn_logit_softcapping") is None
+        if (final_logit_softcap := hparams.get("final_logit_softcapping")):
+            self.gguf_writer.add_final_logit_softcapping(final_logit_softcap)
+        self.gguf_writer.add_head_count_kv(hparams.get("num_key_value_heads", 1))
+        self.gguf_writer.add_add_bos_token(False)
+        self.gguf_writer.add_add_eos_token(False)
+        self.gguf_writer.add_add_space_prefix(False)
+        self.gguf_writer.add_chat_template(
+            "{% for message in messages %}"
+            "<start_of_turn>{{ message['role'] }}\n"
+            "{{ message['content'] }}"
+            "<end_of_turn>\n"
+            "{% endfor %}"
+            "{% if add_generation_prompt %}"
+            "<start_of_turn>model\n"
+            "{% endif %}"
+        )
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+
+        if name in ("rotary_emb.cos_cached", "rotary_emb.sin_cached"):
+            return
+        
+        if "language_model." in name:
+            name = name.replace("language_model.", "")
+
+        # remove OOV (out-of-vocabulary) rows in token_embd
+        if "embed_tokens.weight" in name:
+            n_vocab_real = -1
+            if (self.dir_model / "tokenizer.model").is_file():
+                tokens = self._create_vocab_sentencepiece()[0]
+                n_vocab_real = len(tokens)
+            else:
+                with open(self.dir_model / "tokenizer.json", "r", encoding="utf-8") as f:
+                    tokenizer_json = json.load(f)
+                    n_vocab_real = len(tokenizer_json["model"]["vocab"]) + len(tokenizer_json["added_tokens"])
+            data_torch = data_torch[:n_vocab_real]
+
+        # ref code in Gemma3RMSNorm
+        # output = output * (1.0 + self.weight.float())
+        # note: this is not the case on gemma3n
+        f_shift = self.norm_shift(name)
+        if f_shift != 0.0:
+            data_torch = data_torch + f_shift
+
+        yield from super().modify_tensors(data_torch, name, bid)
+
+
+
+
 @ModelBase.register("Gemma3TextModel")
 class EmbeddingGemma(Gemma3Model):
     model_arch = gguf.MODEL_ARCH.GEMMA_EMBEDDING
