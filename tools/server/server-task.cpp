@@ -326,10 +326,12 @@ task_params server_task::params_from_json_cmpl(
         params.sampling.n_probs = json_value(data, "logprobs", defaults.sampling.n_probs);
     }
 
-    // Legacy OAI completions shape is enabled only when `logprobs` is explicitly
-    // provided as an integer in the request.
-    params.oaicompat_legacy_logprobs =
-        data.contains("logprobs") && data.at("logprobs").is_number_integer();
+    // Legacy OAI completions shape is enabled when explicitly requested via
+    // `legacy_logprobs: true`, or when `echo: true` + integer `logprobs` is used
+    // (lm-evaluation-harness compatibility behavior).
+    const bool has_int_logprobs = data.contains("logprobs") && data.at("logprobs").is_number_integer();
+    const bool legacy_logprobs_flag = json_value(data, "legacy_logprobs", false);
+    params.oaicompat_legacy_logprobs = legacy_logprobs_flag || (params.echo && has_int_logprobs);
 
     // Legacy OAI completions compatibility: when echo=true and logprobs not explicitly
     // requested, default to top-1 so token-level prompt probabilities can be returned.
@@ -715,7 +717,6 @@ json completion_token_output::probs_vector_to_json(const std::vector<completion_
 
 static json oaicompat_legacy_logprobs_from_tokens(
         const std::vector<completion_token_output> & toks,
-        bool post_sampling_probs,
         bool first_token_zero_logprob) {
     json tokens = json::array();
     json token_logprobs = json::array();
@@ -734,14 +735,15 @@ static json oaicompat_legacy_logprobs_from_tokens(
         cur_offset += (int) token_txt.size();
 
         const bool force_zero = first_token_zero_logprob && ti == 0;
-        float logp = force_zero ? 0.0f : (post_sampling_probs ? completion_token_output::logarithm(tok.prob) : tok.prob);
+        // legacy OpenAI completions format requires logprobs values
+        float logp = force_zero ? 0.0f : completion_token_output::logarithm(tok.prob);
         token_logprobs.push_back(logp);
 
         json top = json::object();
         for (size_t i = 0; i < tok.probs.size(); ++i) {
             std::string txt(tok.probs[i].txt);
             txt.resize(validate_utf8(txt));
-            float lp = post_sampling_probs ? completion_token_output::logarithm(tok.probs[i].prob) : tok.probs[i].prob;
+            float lp = completion_token_output::logarithm(tok.probs[i].prob);
             top[txt] = lp;
         }
         if (top.empty()) {
@@ -842,7 +844,6 @@ json server_task_result_cmpl_final::to_json_oaicompat() {
 
             logprobs = oaicompat_legacy_logprobs_from_tokens(
                 merged,
-                post_sampling_probs,
                 generation_params.echo);
         } else {
             logprobs = json{
