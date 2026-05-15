@@ -3827,12 +3827,17 @@ void server_routes::init_routes() {
         auto res = create_response();
         const json body = json::parse(req.body);
         json tokens_response = json::array();
-        if (body.count("content") != 0) {
+        std::string content = json_value(body, "content", std::string());
+        if (content.empty()) {
+            content = json_value(body, "prompt", std::string());
+        }
+
+        if (!content.empty()) {
             const bool add_special = json_value(body, "add_special", false);
             const bool parse_special = json_value(body, "parse_special", true);
             const bool with_pieces = json_value(body, "with_pieces", false);
 
-            llama_tokens tokens = tokenize_mixed(ctx_server.vocab, body.at("content"), add_special, parse_special);
+            llama_tokens tokens = tokenize_mixed(ctx_server.vocab, content, add_special, parse_special);
 
             if (with_pieces) {
                 for (const auto& token : tokens) {
