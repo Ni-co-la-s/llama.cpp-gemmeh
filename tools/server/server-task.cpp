@@ -257,6 +257,7 @@ task_params server_task::params_from_json_cmpl(
     params.timings_per_token = json_value(data, "timings_per_token", false);
 
     params.stream           = json_value(data,       "stream",             false);
+    params.echo             = json_value(data,       "echo",               false);
     auto stream_opt         = json_value(data,       "stream_options",     json::object());
     params.include_usage    = json_value(stream_opt, "include_usage",      false);
     params.cache_prompt     = json_value(data,       "cache_prompt",       defaults.cache_prompt);
@@ -323,6 +324,23 @@ task_params server_task::params_from_json_cmpl(
     // Use OpenAI API logprobs only if n_probs wasn't provided
     if (data.contains("logprobs") && params.sampling.n_probs == defaults.sampling.n_probs){
         params.sampling.n_probs = json_value(data, "logprobs", defaults.sampling.n_probs);
+    }
+
+    // Legacy OAI completions shape is enabled only when `logprobs` is explicitly
+    // provided as an integer in the request.
+    params.oaicompat_legacy_logprobs =
+        data.contains("logprobs") && data.at("logprobs").is_number_integer();
+
+    // Legacy OAI completions compatibility: when echo=true and logprobs not explicitly
+    // requested, default to top-1 so token-level prompt probabilities can be returned.
+    if (params.echo && !data.contains("logprobs") && params.sampling.n_probs == defaults.sampling.n_probs) {
+        params.sampling.n_probs = 1;
+    }
+
+    // Ensure we actually evaluate all prompt tokens so per-token prompt logprobs
+    // are available in echo mode.
+    if (params.echo) {
+        params.cache_prompt = false;
     }
 
     if (data.contains("lora")) {
@@ -695,6 +713,51 @@ json completion_token_output::probs_vector_to_json(const std::vector<completion_
     return out;
 }
 
+static json oaicompat_legacy_logprobs_from_tokens(
+        const std::vector<completion_token_output> & toks,
+        bool post_sampling_probs,
+        bool first_token_zero_logprob) {
+    json tokens = json::array();
+    json token_logprobs = json::array();
+    json top_logprobs = json::array();
+    json text_offset = json::array();
+
+    int cur_offset = 0;
+    for (size_t ti = 0; ti < toks.size(); ++ti) {
+        const auto & tok = toks[ti];
+
+        std::string token_txt(tok.text_to_send);
+        token_txt.resize(validate_utf8(token_txt));
+
+        tokens.push_back(token_txt);
+        text_offset.push_back(cur_offset);
+        cur_offset += (int) token_txt.size();
+
+        const bool force_zero = first_token_zero_logprob && ti == 0;
+        float logp = force_zero ? 0.0f : (post_sampling_probs ? completion_token_output::logarithm(tok.prob) : tok.prob);
+        token_logprobs.push_back(logp);
+
+        json top = json::object();
+        for (size_t i = 0; i < tok.probs.size(); ++i) {
+            std::string txt(tok.probs[i].txt);
+            txt.resize(validate_utf8(txt));
+            float lp = post_sampling_probs ? completion_token_output::logarithm(tok.probs[i].prob) : tok.probs[i].prob;
+            top[txt] = lp;
+        }
+        if (top.empty()) {
+            top[token_txt] = logp;
+        }
+        top_logprobs.push_back(top);
+    }
+
+    return json {
+        {"tokens", tokens},
+        {"token_logprobs", token_logprobs},
+        {"top_logprobs", top_logprobs},
+        {"text_offset", text_offset},
+    };
+}
+
 float completion_token_output::logarithm(float x) {
     // nlohmann::json converts -inf to null, so we need to prevent that
     return x == 0.0f ? std::numeric_limits<float>::lowest() : std::log(x);
@@ -766,10 +829,26 @@ json server_task_result_cmpl_final::usage_json_oaicompat() {
 json server_task_result_cmpl_final::to_json_oaicompat() {
     std::time_t t = std::time(0);
     json logprobs = json(nullptr); // OAI default to null
-    if (!stream && probs_output.size() > 0) {
-        logprobs = json{
-            {"content", completion_token_output::probs_vector_to_json(probs_output, post_sampling_probs)},
-        };
+    if (!stream && (probs_output.size() > 0 || (generation_params.oaicompat_legacy_logprobs && generation_params.echo && prompt_probs_output.size() > 0))) {
+        if (generation_params.oaicompat_legacy_logprobs) {
+            std::vector<completion_token_output> merged;
+            if (generation_params.echo) {
+                merged.reserve(prompt_probs_output.size() + probs_output.size());
+                merged.insert(merged.end(), prompt_probs_output.begin(), prompt_probs_output.end());
+            } else {
+                merged.reserve(probs_output.size());
+            }
+            merged.insert(merged.end(), probs_output.begin(), probs_output.end());
+
+            logprobs = oaicompat_legacy_logprobs_from_tokens(
+                merged,
+                post_sampling_probs,
+                generation_params.echo);
+        } else {
+            logprobs = json{
+                {"content", completion_token_output::probs_vector_to_json(probs_output, post_sampling_probs)},
+            };
+        }
     }
     json finish_reason = "length";
     if (stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS) {

@@ -88,6 +88,7 @@ struct server_slot {
     std::vector<int32_t> i_batch_dft;
 
     std::vector<completion_token_output> generated_token_probs;
+    std::vector<completion_token_output> prompt_token_probs;
 
     bool has_next_token = true;
     bool has_new_line   = false;
@@ -181,6 +182,7 @@ struct server_slot {
         i_batch_dft.clear();
         generated_tokens.clear();
         generated_token_probs.clear();
+        prompt_token_probs.clear();
         json_schema = json();
 
         // clear speculative decoding stats
@@ -1474,6 +1476,9 @@ private:
             res->tokens      = llama_tokens{};
         } else {
             res->content     = std::move(slot.generated_text);
+            if (slot.task->params.echo && slot.task->params.res_type == TASK_RESPONSE_TYPE_OAI_CMPL) {
+                res->content = slot.task->tokens.detokenize(ctx, true) + res->content;
+            }
             res->tokens      = std::move(slot.generated_tokens);
         }
         res->timings         = slot.get_timings();
@@ -1499,6 +1504,12 @@ private:
 
         // populate res.probs_output
         if (slot.task->params.sampling.n_probs > 0) {
+            if (slot.task->params.echo && slot.task->params.res_type == TASK_RESPONSE_TYPE_OAI_CMPL) {
+                res->prompt_probs_output = std::vector<completion_token_output>(
+                        slot.prompt_token_probs.begin(),
+                        slot.prompt_token_probs.end());
+            }
+
             if (!slot.task->params.stream && slot.stop == STOP_TYPE_WORD) {
                 const llama_tokens stop_word_toks = common_tokenize(ctx, slot.stopping_word, false);
 
@@ -2429,6 +2440,16 @@ private:
                         slot.n_prompt_tokens_cache = n_past;
                         slot.n_prompt_tokens_processed = 0;
 
+                        if (slot.task->params.echo && slot.task->params.res_type == TASK_RESPONSE_TYPE_OAI_CMPL
+                                && slot.task->params.sampling.n_probs > 0 && !input_tokens.empty() && input_tokens[0] != LLAMA_TOKEN_NULL) {
+                            completion_token_output first_prompt_tok;
+                            first_prompt_tok.tok = input_tokens[0];
+                            first_prompt_tok.text_to_send = common_token_to_piece(ctx, first_prompt_tok.tok, accept_special_token(slot, first_prompt_tok.tok));
+                            first_prompt_tok.prob = 1.0f;
+                            first_prompt_tok.probs.push_back({ first_prompt_tok.tok, first_prompt_tok.text_to_send, 1.0f });
+                            slot.prompt_token_probs.push_back(std::move(first_prompt_tok));
+                        }
+
                         slot.prompt.tokens.keep_first(n_past);
 
                         // send initial 0% progress update if needed
@@ -2532,11 +2553,15 @@ private:
                         }
 
                         // embedding requires all tokens in the batch to be output
+                        const bool need_prompt_logprobs = slot.task->params.echo
+                            && slot.task->params.res_type == TASK_RESPONSE_TYPE_OAI_CMPL
+                            && slot.task->params.sampling.n_probs > 0;
+
                         common_batch_add(batch,
                             cur_tok,
                             slot.prompt.tokens.pos_next(),
                             { slot.id },
-                            slot.task->need_embd());
+                            slot.task->need_embd() || need_prompt_logprobs);
                         slot.prompt.tokens.push_back(cur_tok);
 
                         slot.n_prompt_tokens_processed++;
@@ -2788,6 +2813,43 @@ private:
             }
 
             for (auto & slot : slots) {
+                if (slot.task &&
+                    (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) &&
+                    slot.task->params.echo &&
+                    slot.task->params.res_type == TASK_RESPONSE_TYPE_OAI_CMPL &&
+                    slot.task->params.sampling.n_probs > 0) {
+                    for (int tok_idx = 0; tok_idx < n_tokens; ++tok_idx) {
+                        if (!batch_view.logits[tok_idx]) {
+                            continue;
+                        }
+                        if (batch_view.n_seq_id[tok_idx] <= 0 || batch_view.seq_id[tok_idx][0] != slot.id) {
+                            continue;
+                        }
+
+                        const llama_pos pos_cur = batch_view.pos[tok_idx];
+                        if (pos_cur < 0) {
+                            continue;
+                        }
+
+                        const size_t target_idx = (size_t) pos_cur + 1;
+                        if (target_idx >= slot.task->tokens.size()) {
+                            continue;
+                        }
+
+                        const llama_token target_tok = slot.task->tokens[target_idx];
+                        if (target_tok == LLAMA_TOKEN_NULL) {
+                            continue;
+                        }
+
+                        completion_token_output prompt_result;
+                        prompt_result.tok = target_tok;
+                        prompt_result.text_to_send = common_token_to_piece(ctx, prompt_result.tok, accept_special_token(slot, prompt_result.tok));
+                        prompt_result.prob = 1.0f;
+                        populate_token_probs(slot, prompt_result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
+                        slot.prompt_token_probs.push_back(std::move(prompt_result));
+                    }
+                }
+
                 // optionally send prompt processing progress
                 if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) {
                     if (slot.task->params.stream && slot.task->params.return_progress) {

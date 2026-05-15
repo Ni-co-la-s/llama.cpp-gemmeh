@@ -48,6 +48,7 @@ enum stop_type {
 struct task_params {
     bool stream          = true;
     bool include_usage   = false;
+    bool echo            = false;
     bool cache_prompt    = true; // remember the prompt to avoid reprocessing all prompt
     bool return_tokens   = false;
     bool return_progress = false;
@@ -70,6 +71,7 @@ struct task_params {
 
     bool timings_per_token   = false;
     bool post_sampling_probs = false;
+    bool oaicompat_legacy_logprobs = false;
 
     struct common_params_sampling sampling;
     struct common_params_speculative speculative;
@@ -351,6 +353,7 @@ struct server_task_result_cmpl_final : server_task_result {
     stop_type stop = STOP_TYPE_NONE;
 
     bool post_sampling_probs;
+    std::vector<completion_token_output> prompt_probs_output;
     std::vector<completion_token_output> probs_output;
     std::vector<std::string>  response_fields;
 
