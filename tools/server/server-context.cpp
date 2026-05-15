@@ -3879,7 +3879,7 @@ void server_routes::init_routes() {
             content = tokens_to_str(ctx_server.vocab, tokens);
         }
 
-        res->ok(json{{"content", std::move(content)}});
+        res->ok(json{{"content", content}, {"prompt", std::move(content)}});
         return res;
     };
 
