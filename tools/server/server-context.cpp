@@ -3800,6 +3800,29 @@ void server_routes::init_routes() {
         return res;
     };
 
+    this->get_tokenizer_info = [this](const server_http_req &) {
+        auto res = create_response();
+
+        const llama_token bos_id = llama_vocab_bos(ctx_server.vocab);
+        const llama_token eos_id = llama_vocab_eos(ctx_server.vocab);
+        const llama_token pad_id = llama_vocab_pad(ctx_server.vocab);
+
+        json tokenizer_info = {
+            { "tokenizer_type", "gguf" },
+            { "vocab_size",     llama_vocab_n_tokens(ctx_server.vocab) },
+            { "bos_token_id",   bos_id != LLAMA_TOKEN_NULL ? json(bos_id) : json(nullptr) },
+            { "eos_token_id",   eos_id != LLAMA_TOKEN_NULL ? json(eos_id) : json(nullptr) },
+            { "pad_token_id",   pad_id != LLAMA_TOKEN_NULL ? json(pad_id) : json(nullptr) },
+            { "bos_token",      bos_id != LLAMA_TOKEN_NULL ? json(common_token_to_piece(ctx_server.vocab, bos_id)) : json(nullptr) },
+            { "eos_token",      eos_id != LLAMA_TOKEN_NULL ? json(common_token_to_piece(ctx_server.vocab, eos_id)) : json(nullptr) },
+            { "add_bos_token",  llama_vocab_get_add_bos(ctx_server.vocab) },
+            { "add_eos_token",  llama_vocab_get_add_eos(ctx_server.vocab) },
+        };
+
+        res->ok(tokenizer_info);
+        return res;
+    };
+
     this->post_tokenize = [this](const server_http_req & req) {
         auto res = create_response();
         const json body = json::parse(req.body);
